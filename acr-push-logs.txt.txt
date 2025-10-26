@@ -1,0 +1,8 @@
+[
+  {
+    "Id": "sha256:7d9a0bcee293b8e7...",
+    "RepoTags": ["sampleacr1234.azurecr.io/sampleapp:v1"],
+    "Size": 142357812,
+    "Created": "2025-10-26T09:34:00.000Z"
+  }
+]

@@ -1,0 +1,2 @@
+REPOSITORY                         TAG       IMAGE ID       CREATED          SIZE
+sampleacr1234.azurecr.io/sampleapp v1        7d9a0bcee293   20 seconds ago   142MB
