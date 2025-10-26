@@ -1,0 +1,19 @@
+# pipeline-fixed.yml
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  name: Default    # Self-hosted agent pool (Windows)
+
+variables:
+  APP_ENV: 'production'
+  API_URL: 'https://api.example.com'
+
+steps:
+- powershell: |
+    Write-Host "Starting build..."
+    Write-Host "APP_ENV: $(APP_ENV)"
+    Write-Host "API_URL: $(API_URL)"
+  displayName: 'Show variables'

@@ -1,0 +1,9 @@
+{
+  "environmentName": "Dev",
+  "appServiceName": "sampleci-app-dev",
+  "resourceGroup": "rg-sample-ci",
+  "appSettings": {
+    "ConnectionString": "Server=dev-sql;Database=AppDB;User Id=devuser;Password=DevPass!",
+    "ApiEndpoint": "https://dev-api.sampleci.com"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "environmentName": "Prod",
+  "appServiceName": "sampleci-app-prod",
+  "resourceGroup": "rg-sample-ci",
+  "appSettings": {
+    "ConnectionString": "Server=prod-sql;Database=AppDB;User Id=produser;Password=ProdPass!",
+    "ApiEndpoint": "https://api.sampleci.com"
+  }
+}

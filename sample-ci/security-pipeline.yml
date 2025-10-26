@@ -1,0 +1,296 @@
+# security-pipeline.yml
+# Multi-stage pipeline:
+#  - Build (restore/build/tests)
+#  - Static analysis with SonarQube
+#  - Dependency scanning (OWASP Dependency-Check, npm audit, dotnet vulnerable check)
+#  - Publish logs/artifacts
+
+trigger:
+  branches:
+    include: [ main ]
+
+variables:
+  USE_SELF_HOSTED: 'false'   # set to 'true' if you want pool: Default (self-hosted)
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '20.x'
+  SCAN_OUTPUT_DIR: 'security-scan-results'
+  SONAR_PROJECT_KEY: 'my-org_my-repo'    # change to your Sonar project key
+  SONAR_PROJECT_NAME: 'my-repo'          # change to your Sonar project name
+
+stages:
+# --------------------------
+# Stage 1: Build & tests
+# --------------------------
+- stage: Build
+  displayName: Build and Test
+  jobs:
+  - job: Build
+    displayName: Build (multi-lang)
+    pool:
+      # choose pool dynamically
+      name: ${{ if eq(variables.USE_SELF_HOSTED, 'true') }}: Default
+      vmImage: ${{ if ne(variables.USE_SELF_HOSTED, 'true') }}: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '$(DOTNET_VERSION)'
+      displayName: 'Use .NET SDK'
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '$(NODE_VERSION)'
+      displayName: 'Use Node.js'
+
+    # .NET restore/build/test (if .NET project exists)
+    - script: |
+        if [ -f "./src/ApiService/ApiService.sln" ]; then
+          dotnet restore ./src/ApiService/ApiService.sln
+          dotnet build ./src/ApiService/ApiService.sln -c Release --no-restore
+          dotnet test ./tests/ApiService.Tests/ApiService.Tests.csproj -c Release --no-build --logger "trx;LogFileName=test-results.trx" --results-directory $(Agent.TempDirectory)/TestResults || true
+        else
+          echo "No .NET solution found - skipping .NET build/test"
+        fi
+      displayName: '.NET restore/build/test'
+      shell: bash
+
+    # Node install/build/test (if Node project exists)
+    - script: |
+        if [ -f "./src/WebClient/package.json" ]; then
+          cd src/WebClient
+          npm ci
+          npm run build --if-present
+          npm test --silent || true
+          cd -
+        else
+          echo "No Node app found - skipping Node steps"
+        fi
+      displayName: 'Node install/build/test'
+      shell: bash
+
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)
+      displayName: 'Prepare scan output folder'
+      shell: bash
+
+# --------------------------
+# Stage 2: SonarQube analysis
+# --------------------------
+- stage: CodeAnalysis
+  displayName: SonarQube Analysis
+  dependsOn: Build
+  jobs:
+  - job: Sonar
+    displayName: 'Run SonarQube analysis'
+    pool:
+      name: ${{ if eq(variables.USE_SELF_HOSTED, 'true') }}: Default
+      vmImage: ${{ if ne(variables.USE_SELF_HOSTED, 'true') }}: 'ubuntu-latest'
+    steps:
+      - checkout: self
+
+      # Prepare Sonar analysis
+      - task: SonarQubePrepare@5
+        inputs:
+          SonarQube: '$(SONAR_ENDPOINT)'           # service connection name configured in DevOps
+          scannerMode: 'CLI'
+          configMode: 'manual'
+          cliProjectKey: '$(SONAR_PROJECT_KEY)'
+          cliProjectName: '$(SONAR_PROJECT_NAME)'
+          extraProperties: |
+            sonar.projectVersion=$(Build.BuildId)
+            sonar.sources=.
+            sonar.cs.opencover.reportsPaths=$(Agent.TempDirectory)/**/coverage.opencover.xml
+
+      # Run build to generate analysis data (depending on repo languages)
+      - script: |
+          # for .NET
+          if [ -f "./src/ApiService/ApiService.sln" ]; then
+            dotnet build ./src/ApiService/ApiService.sln -c Release
+          fi
+          # for JS/TS - optional build
+          if [ -f "./src/WebClient/package.json" ]; then
+            cd src/WebClient
+            npm run build --if-present
+            cd -
+          fi
+        displayName: 'Prepare project for Sonar'
+        shell: bash
+
+      # Run Sonar analyze & publish
+      - task: SonarQubeAnalyze@5
+        displayName: 'Run SonarQube scanner'
+
+      - task: SonarQubePublish@5
+        inputs:
+          pollingTimeoutSec: '300'
+        displayName: 'Publish SonarQube results'
+
+      - script: |
+          echo "Sonar analysis complete. Exporting summary..."
+          mkdir -p $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/sonar
+          # fetch simple report via Sonar Web API if SONAR_TOKEN & SONAR_HOST_URL available (optional)
+          if [ -n "$(SONAR_TOKEN)" ] && [ -n "$(SONAR_HOST_URL)" ]; then
+            curl -s -u $(SONAR_TOKEN): "$(SONAR_HOST_URL)/api/issues/search?componentKeys=$(SONAR_PROJECT_KEY)&ps=500" > $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/sonar/issues.json || true
+          fi
+          echo "done"
+        env:
+          SONAR_TOKEN: $(SONAR_TOKEN)
+          SONAR_HOST_URL: $(SONAR_HOST_URL)
+        displayName: 'Export Sonar issues (optional)'
+        shell: bash
+
+# --------------------------
+# Stage 3: Dependency scanning
+# --------------------------
+- stage: DependencyScanning
+  displayName: Dependency Scans
+  dependsOn: CodeAnalysis
+  jobs:
+  - job: DepScan
+    displayName: Run dependency scanners
+    pool:
+      name: ${{ if eq(variables.USE_SELF_HOSTED, 'true') }}: Default
+      vmImage: ${{ if ne(variables.USE_SELF_HOSTED, 'true') }}: 'ubuntu-latest'
+    steps:
+      - checkout: self
+
+      # Create output directory for scan results
+      - script: |
+          mkdir -p $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)
+        displayName: 'Prepare scan output folder'
+        shell: bash
+
+      # 1) OWASP Dependency-Check (Java tool) - install & run
+      - script: |
+          echo "Running OWASP Dependency-Check..."
+          DEP_DIR=$(Build.SourcesDirectory)/.dependency-check
+          mkdir -p $DEP_DIR
+          # Install dependency-check CLI (if on ubuntu)
+          if [ "$(uname -s)" = "Linux" ]; then
+            wget -q https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.1/dependency-check-8.4.1-release.zip -O /tmp/dc.zip || true
+            unzip -o /tmp/dc.zip -d $DEP_DIR || true
+            $DEP_DIR/dependency-check/bin/dependency-check.sh --project "repo-scan" --scan $(Build.SourcesDirectory) --format ALL --out $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/dependency-check || true
+          else
+            echo "OWASP Dependency-Check skipped on non-linux agent (or not installed)."
+          fi
+        displayName: 'OWASP Dependency-Check (all languages)'
+        shell: bash
+
+      # 2) npm audit for Node.js (if Node project exists)
+      - script: |
+          if [ -f "./src/WebClient/package.json" ]; then
+            echo "Running npm audit..."
+            cd src/WebClient
+            npm audit --json > $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/npm-audit.json || true
+            npm audit --json | jq '.advisories' > $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/npm-audit-advisories.json || true
+            cd -
+          else
+            echo "No Node project found - skipping npm audit."
+          fi
+        displayName: 'npm audit'
+        shell: bash
+
+      # 3) dotnet vulnerable packages check (if .NET project exists)
+      - script: |
+          if [ -f "./src/ApiService/ApiService.sln" ]; then
+            echo "Checking .NET packages for vulnerabilities..."
+            # .NET SDK 6+ supports 'dotnet list package --vulnerable'
+            dotnet list ./src/ApiService/ApiService.csproj package --vulnerable > $(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)/dotnet-vulnerable.txt || true
+          else
+            echo "No .NET project found - skipping dotnet vulnerable check."
+          fi
+        displayName: '.NET vulnerable packages'
+        shell: bash
+
+      # 4) Simple SAST example: ESLint or tslint (optional)
+      - script: |
+          if [ -f "./src/WebClient/package.json" ]; then
+            cd src/WebClient
+            if npm run | grep -q lint; then
+              npm run lint --silent || true
+            fi
+            cd -
+          fi
+        displayName: 'Optional lint (JS SAST)'
+
+      # 5) Summarize & produce a simple human-readable scan report
+      - script: |
+          echo "Generating combined security-scan-summary.txt..."
+          OUTDIR=$(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)
+          echo "=== Security scan summary ===" > $OUTDIR/security-scan-summary.txt
+          echo "Sonar issues (if exported):" >> $OUTDIR/security-scan-summary.txt
+          if [ -f $OUTDIR/sonar/issues.json ]; then
+            jq '.total' $OUTDIR/sonar/issues.json >> $OUTDIR/security-scan-summary.txt || true
+          else
+            echo "No sonar issues exported." >> $OUTDIR/security-scan-summary.txt
+          fi
+          echo "" >> $OUTDIR/security-scan-summary.txt
+          echo "Dependency-Check results:" >> $OUTDIR/security-scan-summary.txt
+          if [ -f $OUTDIR/dependency-check/dependency-check-report.html ]; then
+            echo "Dependency-Check HTML report generated: dependency-check-report.html" >> $OUTDIR/security-scan-summary.txt
+          else
+            echo "Dependency-Check report not found" >> $OUTDIR/security-scan-summary.txt
+          fi
+          echo "" >> $OUTDIR/security-scan-summary.txt
+          echo "npm audit summary:" >> $OUTDIR/security-scan-summary.txt
+          if [ -f $OUTDIR/npm-audit.json ]; then
+            cat $OUTDIR/npm-audit.json | jq '{metadata: .metadata, advisories_count: ( .advisories | length )}' >> $OUTDIR/security-scan-summary.txt || true
+          else
+            echo "No npm audit file" >> $OUTDIR/security-scan-summary.txt
+          fi
+          echo "" >> $OUTDIR/security-scan-summary.txt
+          echo "dotnet vulnerable summary:" >> $OUTDIR/security-scan-summary.txt
+          if [ -f $OUTDIR/dotnet-vulnerable.txt ]; then
+            cat $OUTDIR/dotnet-vulnerable.txt >> $OUTDIR/security-scan-summary.txt || true
+          else
+            echo "No dotnet vulnerable output" >> $OUTDIR/security-scan-summary.txt
+          fi
+        displayName: 'Create security-scan-summary.txt'
+        shell: bash
+
+      # Publish results as pipeline artifacts
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)'
+          ArtifactName: 'SecurityScanResults'
+          publishLocation: 'Container'
+        displayName: 'Publish security scan artifacts'
+
+# --------------------------
+# Stage 4: Gate or fail on critical vulnerabilities (optional)
+# --------------------------
+- stage: Gate
+  displayName: Gate - Block on critical vulnerabilities
+  dependsOn: DependencyScanning
+  condition: always()
+  jobs:
+  - job: BlockIfCritical
+    displayName: 'Check for critical / high vulnerabilities and fail pipeline if present'
+    pool:
+      name: ${{ if eq(variables.USE_SELF_HOSTED, 'true') }}: Default
+      vmImage: ${{ if ne(variables.USE_SELF_HOSTED, 'true') }}: 'ubuntu-latest'
+    steps:
+      - script: |
+          set -e
+          OUTDIR=$(Build.ArtifactStagingDirectory)/$(SCAN_OUTPUT_DIR)
+          echo "Checking npm audit for high/critical..."
+          if [ -f $OUTDIR/npm-audit.json ]; then
+            CRIT=$(jq '[.advisories[]? | select(.severity == "high" or .severity=="critical")] | length' $OUTDIR/npm-audit.json || echo 0)
+            echo "High/Critical npm advisories: $CRIT"
+            if [ "$CRIT" -gt "0" ]; then
+              echo "Pipeline failing due to high/critical npm vulnerabilities."
+              exit 1
+            fi
+          fi
+          echo "Checking dotnet vulnerable output..."
+          if [ -f $OUTDIR/dotnet-vulnerable.txt ]; then
+            if grep -q "Vulnerable" $OUTDIR/dotnet-vulnerable.txt; then
+              echo "Found vulnerable .NET packages"
+              exit 1
+            fi
+          fi
+          echo "No blocking high/critical vulnerabilities found in quick checks."
+        displayName: 'Fail on high severity findings (quick checks)'
+        shell: bash

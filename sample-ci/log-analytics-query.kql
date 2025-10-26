@@ -1,0 +1,96 @@
+// log-analytics-query.kql
+// Purpose: Identify error patterns in application logs over the last 24 hours.
+// Workspace: Run this in your Log Analytics workspace (Container Insights / App Insights logs or generic Log Analytics).
+
+// ============================
+// 0) Quick settings (last 24 hours)
+// ============================
+let TimeRange = 24h;
+
+// ============================
+// 1) Primary query: group error logs by message and count
+//    - Works against several common tables: AppTraces, AppRequests, AppExceptions, or custom LogAnalytics table
+//    - Adjust table name to match your workspace (e.g., AppTraces, AzureDiagnostics, ContainerLog, or CustomLog_CL)
+// ============================
+union isfuzzy=true
+    AppTraces
+    | where TimeGenerated >= ago(TimeRange)
+    | where SeverityLevel >= 3 or SeverityLevel == 'Error' or SeverityLevel == 'error'
+    | extend Message = tostring(Message)
+,
+    AppExceptions
+    | where TimeGenerated >= ago(TimeRange)
+    | extend Message = strcat("Exception: ", tostring(Type), " - ", tostring(Message))
+,
+    AppRequests
+    | where TimeGenerated >= ago(TimeRange)
+    | where Success == false or ResultCode startswith "5"
+    | extend Message = strcat("Request failed: ", tostring(Name), " -> ", tostring(ResultCode))
+,
+    // Fallback for generic diagnostics / custom logs - uncomment if you use AzureDiagnostics or custom table
+    // AzureDiagnostics
+    // | where TimeGenerated >= ago(TimeRange) and (Level == "Error" or Level == "Error")
+    // | extend Message = tostring(message_s)
+    // CustomLog_CL
+    // | where TimeGenerated >= ago(TimeRange) and LogLevel_s == "Error"
+    // | extend Message = tostring(LogMessage_s)
+| summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by Message = take_any(trim(" \r\n\t", Message))
+| order by Count desc
+| top 50 by Count
+
+// ============================
+// 2) Time series for top N error messages (for trend analysis)
+// ============================
+let TopMessages = (union AppTraces, AppExceptions, AppRequests
+    | where TimeGenerated >= ago(TimeRange)
+    | extend Message = tostring(coalesce(Message, strcat("Exception: ", tostring(Type), " ", tostring(Name)))))
+    | summarize Count = count() by Message
+    | top 5 by Count
+    | project Message);
+union AppTraces, AppExceptions, AppRequests
+| where TimeGenerated >= ago(TimeRange)
+| extend Message = tostring(coalesce(Message, strcat("Exception: ", tostring(Type), " ", tostring(Name))))
+| where Message in (TopMessages)
+| summarize Count = count() by bin(TimeGenerated, 1h), Message
+| render timechart
+
+// ============================
+// 3) Frequent exceptions with stack trace excerpt (if available)
+// ============================
+AppExceptions
+| where TimeGenerated >= ago(TimeRange)
+| extend ExType = tostring(Type), ExMessage = tostring(Message), Stack = tostring(ParsedStack)
+| summarize Count = count(), SampleStack = any(Stack) by ExType, ExMessage
+| order by Count desc
+| top 50 by Count
+
+// ============================
+// 4) Correlate errors to top failing operations (requests)
+// ============================
+AppRequests
+| where TimeGenerated >= ago(TimeRange)
+| where Success == false or ResultCode startswith "5"
+| summarize Fails = count(), AvgDurationMs = avg(DurationMs) by Operation = tostring(Name), ResultCode
+| order by Fails desc
+| top 50 by Fails
+
+// ============================
+// 5) Error hotspots by server/node/container (helpful for AKS)
+// ============================
+union AppTraces, AppExceptions, AppRequests, ContainerLog
+| where TimeGenerated >= ago(TimeRange)
+| where (SeverityLevel >= 3) or (ResultCode startswith "5") or (LogEntryLevel_s == "Error")
+| extend Host = coalesce(Computer, ContainerID, Node, Computer_s)
+| summarize Errors = count() by Host
+| order by Errors desc
+| top 50 by Errors
+
+// ============================
+// 6) Raw matching logs for deeper inspection (paginated)
+// ============================
+union AppTraces, AppExceptions, AppRequests, ContainerLog
+| where TimeGenerated >= ago(TimeRange)
+| where (SeverityLevel >= 3) or (ResultCode startswith "5") or (LogEntryLevel_s == "Error")
+| project TimeGenerated, TenantId=tenantId, Source = coalesce(Cloud_RoleName, "app"), Host = coalesce(Computer, Node, ContainerID), Level = coalesce(tostring(SeverityLevel), LogEntryLevel_s, ResultCode), Message = coalesce(tostring(Message), tostring(Exceptions), tostring(Message_s), tostring(LogMessage_s))
+| order by TimeGenerated desc
+| take 1000

@@ -1,0 +1,191 @@
+trigger:
+  branches:
+    include: [ main ]
+
+variables:
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '20.x'
+  buildConfiguration: 'Release'
+  artifactName: 'drop'
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build and Test All'
+  jobs:
+
+  - job: DotNet
+    displayName: '.NET Build & Test'
+    pool:
+      name: 'Default'
+    steps:
+      - task: UseDotNet@2
+        displayName: 'Use .NET SDK'
+        inputs:
+          packageType: 'sdk'
+          version: $(DOTNET_VERSION)
+
+      - task: PowerShell@2
+        displayName: 'Build & Test .NET (capture logs & TRX)'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $ErrorActionPreference = 'Stop'
+            $stagingDotnet = "$(Build.ArtifactStagingDirectory)\dotnet"
+            $stagingLogs = Join-Path $stagingDotnet "logs"
+            $stagingTest = Join-Path $stagingDotnet "test-results"
+            New-Item -ItemType Directory -Force -Path $stagingLogs | Out-Null
+            New-Item -ItemType Directory -Force -Path $stagingTest | Out-Null
+
+            Push-Location "$(Build.SourcesDirectory)\src\ApiService"
+
+            Write-Host "=== dotnet restore ==="
+            dotnet restore ".\ApiService.sln" | Tee-Object -FilePath (Join-Path $stagingLogs "dotnet-restore.log")
+
+            Write-Host "=== dotnet build ==="
+            dotnet build ".\ApiService.csproj" -c $(buildConfiguration) --no-restore | Tee-Object -FilePath (Join-Path $stagingLogs "dotnet-build.log")
+
+            Write-Host "=== dotnet test (TRX) ==="
+            $trxOut = Join-Path -Path "$(Agent.TempDirectory)" -ChildPath "TestResults"
+            if (-Not (Test-Path $trxOut)) { New-Item -ItemType Directory -Force -Path $trxOut | Out-Null }
+
+            dotnet test "$(Build.SourcesDirectory)\tests\ApiService.Tests\ApiService.Tests.csproj" `
+              -c $(buildConfiguration) `
+              --logger "trx;LogFileName=test-results.trx" `
+              --results-directory "$trxOut" `
+              --no-build | Tee-Object -FilePath (Join-Path $stagingLogs "dotnet-test.log")
+
+            if (Test-Path $trxOut) {
+              Copy-Item -Recurse -Force "$trxOut\*" $stagingTest
+            }
+
+            Pop-Location
+            Write-Host "✅ .NET build/test completed"
+
+      - task: PublishTestResults@2
+        displayName: 'Publish .NET test results (TRX)'
+        inputs:
+          testResultsFormat: 'VSTest'
+          testResultsFiles: '$(Build.ArtifactStagingDirectory)/dotnet/test-results/*.trx'
+          failTaskOnFailedTests: true
+        condition: succeededOrFailed()
+
+  - job: Node
+    displayName: 'Node Build & Test'
+    pool:
+      name: 'Default'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Use Node'
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+
+      - task: PowerShell@2
+        displayName: 'Node: install / build / test (PowerShell-safe)'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $ErrorActionPreference = 'Stop'
+            $stagingWeb = "$(Build.ArtifactStagingDirectory)\webclient"
+            $stagingLogs = Join-Path $stagingWeb "logs"
+            $stagingTest = Join-Path $stagingWeb "test-results"
+            New-Item -ItemType Directory -Force -Path $stagingWeb | Out-Null
+            New-Item -ItemType Directory -Force -Path $stagingLogs | Out-Null
+            New-Item -ItemType Directory -Force -Path $stagingTest | Out-Null
+
+            $transcriptFile = Join-Path $stagingLogs "npm-transcript.log"
+            Start-Transcript -Path $transcriptFile -Force
+
+            Push-Location "$(Build.SourcesDirectory)\src\WebClient"
+
+            Write-Host "=== npm install ==="
+            npm install --no-audit --no-fund
+
+            Write-Host "=== npm run build (if exists) ==="
+            try {
+              npm run build --if-present
+            } catch {
+              Write-Host "⚠️ npm build script missing or failed — continuing."
+            }
+
+            Write-Host "=== npm test ==="
+            try {
+              npm test --silent
+            } catch {
+              Write-Host "⚠️ npm test failed or no script — continuing."
+            }
+
+            Pop-Location
+            Stop-Transcript
+            Write-Host "✅ Node build/test finished. Logs at $transcriptFile"
+
+      - task: PublishTestResults@2
+        displayName: 'Publish Node test results (JUnit)'
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: 'src/WebClient/test-results/**/*.xml'
+          failTaskOnFailedTests: true
+
+      - task: PowerShell@2
+        displayName: 'Copy Node artifacts to staging'
+        inputs:
+          targetType: 'inline'
+          script: |
+            $ErrorActionPreference = 'Continue'
+            $webStaging = "$(Build.ArtifactStagingDirectory)\webclient"
+            New-Item -ItemType Directory -Force -Path $webStaging | Out-Null
+
+            $candidates = @(
+              "$(Build.SourcesDirectory)\src\WebClient\build",
+              "$(Build.SourcesDirectory)\src\WebClient\dist",
+              "$(Build.SourcesDirectory)\src\WebClient\out",
+              "$(Build.SourcesDirectory)\src\WebClient\public"
+            )
+
+            foreach ($p in $candidates) {
+              if (Test-Path $p) {
+                Write-Host "Copying $p"
+                Copy-Item -Recurse -Force "$p\*" "$webStaging\" -ErrorAction SilentlyContinue
+              }
+            }
+
+            if (Test-Path "$(Build.SourcesDirectory)\src\WebClient\test-results") {
+              Copy-Item -Recurse -Force "$(Build.SourcesDirectory)\src\WebClient\test-results\*" "$webStaging\test-results\" -ErrorAction SilentlyContinue
+            }
+
+            Write-Host "📦 Node artifacts staged successfully"
+
+- stage: Publish
+  displayName: 'Publish Artifacts'
+  dependsOn: BuildAndTest
+  jobs:
+  - job: Publish
+    displayName: 'Publish artifacts'
+    pool:
+      name: 'Default'
+    steps:
+      - task: PowerShell@2
+        displayName: 'List staging directory'
+        inputs:
+          targetType: 'inline'
+          script: |
+            if (Test-Path "$(Build.ArtifactStagingDirectory)") {
+              Write-Host "Artifact staging directory contents:"
+              Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Recurse | ForEach-Object { Write-Host $_.FullName }
+            } else {
+              Write-Host "Artifact staging directory empty"
+            }
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish build artifact (container)'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: '$(artifactName)'
+          publishLocation: 'Container'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish pipeline artifact'
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)'
+          artifact: 'pipeline-$(artifactName)'
+          publishLocation: 'pipeline'

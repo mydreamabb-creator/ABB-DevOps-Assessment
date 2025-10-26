@@ -1,0 +1,114 @@
+# multi-stage-deploy-only.yml
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci
+      source: sample-ci
+      trigger:
+        branches:
+          include: [ main ]
+
+variables:
+  serviceConnection: 'AzureServiceConnection'   # <-- change to exact name in Project Settings -> Service connections
+  poolName: 'Default'                           # <-- your agent pool (self-hosted) or 'Azure Pipelines' if hosted
+  artifactGlob: '**/drop/**'                    # <-- adjust if CI artifact path is different
+  appDevName: 'sampleci-app-dev'                # <-- set to your actual dev app name
+  appTestName: 'sampleci-app-test'              # <-- set to your actual test app name
+  appProdName: 'sampleci-app-prod'              # <-- set to your actual prod app name
+
+stages:
+- stage: Dev
+  displayName: 'Deploy → Dev'
+  jobs:
+  - job: DeployDev
+    displayName: 'Deploy to Dev'
+    pool:
+      name: $(poolName)
+    steps:
+      - download: ci
+      - task: PowerShell@2
+        displayName: 'Record Dev deploy start'
+        inputs:
+          targetType: 'inline'
+          script: |
+            New-Item -ItemType Directory -Force -Path "$(Pipeline.Workspace)/deployment-logs" | Out-Null
+            "Dev deploy started at $(Get-Date)" | Out-File "$(Pipeline.Workspace)/deployment-logs/dev-start.txt"
+      - task: AzureWebApp@1
+        displayName: 'Deploy to Azure App Service (Dev)'
+        inputs:
+          azureSubscription: $(serviceConnection)
+          appType: 'webApp'             # use webAppLinux for Linux
+          appName: $(appDevName)
+          package: '$(Pipeline.Workspace)/$(artifactGlob)'
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Dev logs'
+        inputs:
+          targetPath: '$(Pipeline.Workspace)/deployment-logs'
+          artifact: 'deployment-logs-dev'
+          publishLocation: 'pipeline'
+
+- stage: Test
+  displayName: 'Deploy → Test (requires approval)'
+  dependsOn: Dev
+  condition: succeeded()
+  jobs:
+  - job: DeployTest
+    displayName: 'Deploy to Test'
+    pool:
+      name: $(poolName)
+    steps:
+      - download: ci
+      - task: PowerShell@2
+        displayName: 'Record Test deploy start'
+        inputs:
+          targetType: 'inline'
+          script: |
+            New-Item -ItemType Directory -Force -Path "$(Pipeline.Workspace)/deployment-logs" | Out-Null
+            "Test deploy started at $(Get-Date)" | Out-File "$(Pipeline.Workspace)/deployment-logs/test-start.txt"
+      - task: AzureWebApp@1
+        displayName: 'Deploy to Azure App Service (Test)'
+        inputs:
+          azureSubscription: $(serviceConnection)
+          appType: 'webApp'
+          appName: $(appTestName)
+          package: '$(Pipeline.Workspace)/$(artifactGlob)'
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Test logs'
+        inputs:
+          targetPath: '$(Pipeline.Workspace)/deployment-logs'
+          artifact: 'deployment-logs-test'
+          publishLocation: 'pipeline'
+
+- stage: Prod
+  displayName: 'Deploy → Prod (requires approval)'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: DeployProd
+    displayName: 'Deploy to Prod'
+    pool:
+      name: $(poolName)
+    steps:
+      - download: ci
+      - task: PowerShell@2
+        displayName: 'Record Prod deploy start'
+        inputs:
+          targetType: 'inline'
+          script: |
+            New-Item -ItemType Directory -Force -Path "$(Pipeline.Workspace)/deployment-logs" | Out-Null
+            "Prod deploy started at $(Get-Date)" | Out-File "$(Pipeline.Workspace)/deployment-logs/prod-start.txt"
+      - task: AzureWebApp@1
+        displayName: 'Deploy to Azure App Service (Prod)'
+        inputs:
+          azureSubscription: $(serviceConnection)
+          appType: 'webApp'
+          appName: $(appProdName)
+          package: '$(Pipeline.Workspace)/$(artifactGlob)'
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Prod logs'
+        inputs:
+          targetPath: '$(Pipeline.Workspace)/deployment-logs'
+          artifact: 'deployment-logs-prod'
+          publishLocation: 'pipeline'

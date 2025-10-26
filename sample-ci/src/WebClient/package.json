@@ -1,0 +1,17 @@
+{
+  "name": "webclient",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "jest --runInBand --reporters=default --reporters=jest-junit",
+    "build": "echo \"build step (no-op)\""
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "jest-junit": "^13.0.0"
+  },
+  "jest-junit": {
+    "outputDirectory": "test-results",
+    "outputName": "junit.xml"
+  }
+}

@@ -1,0 +1,201 @@
+# cd-pipeline.yml
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci             # alias used in this YAML
+      source: sample-ci        # name of your CI pipeline (change if needed)
+      trigger:
+        branches:
+          include: [ main ]
+
+variables:
+  # --- EDIT THESE TO MATCH YOUR AZURE RESOURCES ---
+  serviceConnection: 'AzureServiceConnection'   # Azure RM service connection name
+  resourceGroup: 'rg-sample-ci'                 # resource group for App Service / AKS
+  appName: 'sampleci-app'                       # App Service name (if using appservice)
+  aksResourceGroup: 'rg-sample-ci'              # AKS resource group (if using AKS)
+  aksClusterName: 'sampleci-aks'                # AKS cluster name
+  deployTarget: 'appservice'                    # 'appservice' or 'aks'
+  # ---------------------------------------------------------------------------
+
+stages:
+
+- stage: deploy-dev
+  displayName: 'Deploy → Dev'
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy to Dev'
+    environment: 'dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+            # 1) download CI artifacts (alias 'ci' above)
+            - download: ci
+              displayName: 'Download CI artifacts'
+
+            # 2) discover artifact path(s) robustly and record to file
+            - task: PowerShell@2
+              displayName: 'Discover artifact path & prepare deployment logs (Dev)'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $ErrorActionPreference = 'Stop'
+                  $outDir = "$(Pipeline.Workspace)/deployment-logs"
+                  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+                  # Try a few candidate artifact folders (adjust if your CI uses a different name)
+                  $artifactCandidates = @(
+                    "$(Pipeline.Workspace)/ci/drop",
+                    "$(Pipeline.Workspace)/ci/pipeline-drop",
+                    "$(Pipeline.Workspace)/drop",
+                    "$(Pipeline.Workspace)/**/drop"
+                  )
+
+                  Write-Host "Searching for artifacts under $(Pipeline.Workspace)..."
+                  $found = @()
+                  foreach ($c in $artifactCandidates) {
+                    try {
+                      $matches = Get-ChildItem -Path $c -Recurse -ErrorAction SilentlyContinue
+                      if ($matches) { $found += $c; Write-Host "Matched candidate: $c" }
+                    } catch {}
+                  }
+                  if (-not $found) {
+                    Write-Host "No artifact candidates matched; listing workspace for debugging:"
+                    Get-ChildItem -Path "$(Pipeline.Workspace)" -Recurse -Depth 2 | ForEach-Object { Write-Host $_.FullName }
+                  } else {
+                    Write-Host "Artifact candidate(s) that matched: $found"
+                  }
+
+                  # Save info to a file to include in deployment-logs artifact
+                  $infoFile = Join-Path $outDir "artifact-discovery.txt"
+                  "Workspace: $(Pipeline.Workspace)" | Out-File -FilePath $infoFile -Encoding utf8
+                  "FoundCandidates: $($found -join ';')" | Out-File -FilePath $infoFile -Append
+
+                  Write-Host "Discovery info written to $infoFile"
+                  Write-Host "##vso[task.setvariable variable=DEPLOY_ARTIFACT_WORK_DIR]$found"
+            
+            # 3) Deploy conditionally to App Service or AKS
+            - ${{ if eq(variables.deployTarget, 'appservice') }}:
+              - task: AzureWebApp@1
+                displayName: 'Deploy to Azure App Service (Dev)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  appType: 'webApp'   # change to webAppLinux if your app is Linux
+                  appName: $(appName)
+                  # use wildcard to match artifact path discovered above; adjust if needed
+                  package: '$(Pipeline.Workspace)/**/drop/**'
+
+              - task: AzureCLI@2
+                displayName: 'Capture App Service info (Dev)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -e
+                    echo "App: $(appName)"
+                    az webapp show -g "$(resourceGroup)" -n "$(appName)" > "$(Pipeline.Workspace)/deployment-logs/appservice-dev-show.json" || true
+                    echo "Listing deployment logs (if any)..."
+                    az webapp deployment list-publishing-profiles -g "$(resourceGroup)" -n "$(appName)" > "$(Pipeline.Workspace)/deployment-logs/appservice-dev-publish.json" || true
+
+            - ${{ if eq(variables.deployTarget, 'aks') }}:
+              - task: AzureCLI@2
+                displayName: 'Deploy to AKS (Dev)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -e
+                    az aks get-credentials -g $(aksResourceGroup) -n $(aksClusterName) --overwrite-existing
+                    echo "Applying manifests (dev)..."
+                    if [ -d "manifests/dev" ]; then
+                      kubectl apply -f manifests/dev
+                      kubectl get pods -n default -o wide > "$(Pipeline.Workspace)/deployment-logs/aks-dev-pods.txt" || true
+                    else
+                      echo "No manifests/dev folder found" > "$(Pipeline.Workspace)/deployment-logs/aks-dev-note.txt"
+                    fi
+
+            # 4) publish the deployment logs captured into pipeline artifact
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish deployment logs (Dev)'
+              inputs:
+                targetPath: '$(Pipeline.Workspace)/deployment-logs'
+                artifact: 'deployment-logs-dev'
+                publishLocation: 'pipeline'
+
+- stage: deploy-prod
+  displayName: 'Deploy → Prod (requires approval)'
+  dependsOn: deploy-dev
+  condition: succeeded()
+  jobs:
+  - deployment: DeployProd
+    displayName: 'Deploy to Prod'
+    environment: 'prod'       # IMPORTANT: environment 'prod' must have Approvals configured in Azure DevOps UI
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+            - download: ci
+              displayName: 'Download CI artifacts'
+
+            - task: PowerShell@2
+              displayName: 'Discover artifact path & prepare deployment logs (Prod)'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $ErrorActionPreference = 'Stop'
+                  $outDir = "$(Pipeline.Workspace)/deployment-logs"
+                  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+                  # Minimal record for logs
+                  "Prod deployment started at: $(Build.BuildId) $(DateTime)" | Out-File -FilePath (Join-Path $outDir "prod-start.txt")
+                  Write-Host "Prepared deployment logs folder: $outDir"
+
+            - ${{ if eq(variables.deployTarget, 'appservice') }}:
+              - task: AzureWebApp@1
+                displayName: 'Deploy to Azure App Service (Prod)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  appType: 'webApp'  # change to webAppLinux for Linux apps
+                  appName: $(appName)
+                  package: '$(Pipeline.Workspace)/**/drop/**'
+
+              - task: AzureCLI@2
+                displayName: 'Capture App Service info (Prod)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -e
+                    az webapp show -g "$(resourceGroup)" -n "$(appName)" > "$(Pipeline.Workspace)/deployment-logs/appservice-prod-show.json" || true
+                    az webapp deployment list-publishing-profiles -g "$(resourceGroup)" -n "$(appName)" > "$(Pipeline.Workspace)/deployment-logs/appservice-prod-publish.json" || true
+
+            - ${{ if eq(variables.deployTarget, 'aks') }}:
+              - task: AzureCLI@2
+                displayName: 'Deploy to AKS (Prod)'
+                inputs:
+                  azureSubscription: $(serviceConnection)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -e
+                    az aks get-credentials -g $(aksResourceGroup) -n $(aksClusterName) --overwrite-existing
+                    if [ -d "manifests/prod" ]; then
+                      kubectl apply -f manifests/prod
+                      kubectl get pods -o wide > "$(Pipeline.Workspace)/deployment-logs/aks-prod-pods.txt" || true
+                    else
+                      echo "No manifests/prod folder found" > "$(Pipeline.Workspace)/deployment-logs/aks-prod-note.txt"
+                    fi
+
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish deployment logs (Prod)'
+              inputs:
+                targetPath: '$(Pipeline.Workspace)/deployment-logs'
+                artifact: 'deployment-logs-prod'
+                publishLocation: 'pipeline'
